@@ -1777,6 +1777,7 @@ impl Document {
         let mut hybrids: HashMap<i64, Option<BTreeMap<u32, XrefEntry>>> = HashMap::new();
         let (mut hybrid_rows, mut noted) = (0usize, HashSet::new());
         let mut next = Some(first);
+        
         while let Some(off) = next.take() {
             if !visited.insert(off) || visited.len() > 10_000 {
                 log.push(format!("cross-reference chain loops at offset {off}; stopped"));
@@ -1786,66 +1787,13 @@ impl Document {
             let mut sect = BTreeMap::new();
             // Object numbers whose entry in this section was set aside ([`Self::xref_oddities`]).
             let mut odd = Vec::new();
-            let ((sect_trailer, is_stream), header_relative) = match self.read_section(off as usize, &mut sect, &mut odd, log) {
-                Ok(v) => (v, false),
-                Err(e) if self.header_offset > 0 => {
-                    log.push(format!("xref at {off} unreadable ({e}); retrying relative to the header"));
-                    sect.clear();
-                    odd.clear();
-                    (self.read_section(off as usize + self.header_offset, &mut sect, &mut odd, log)?, true)
-                }
-                Err(e) => {
-                    // An unreadable older section loses every object only it locates (the page
-                    // tree, often): rebuild from object headers, as readers do (#1656).
-                    if !revisions.is_empty() {
-                        log.push(format!("older cross-reference section at {off} is unreadable: {e}"));
-                    }
-                    return Err(e);
-                }
-            };
+            let (sect_trailer, is_stream, header_relative) = 
+                self.read_section_with_retry(off, &mut sect, &mut odd, log, revisions.is_empty())?;
+
             revisions.push(Revision { xref_offset: off, is_stream, header_relative });
-            // Hybrid files (§7.5.8.4): the /XRefStm entries supplement the table and replace the
-            // free entries it gives objects only a cross-reference stream can locate.
-            let hybrid = sect_trailer.int(b"XRefStm").filter(|x| *x >= 0);
-            if let Some((x, read)) = hybrid.and_then(|x| hybrids.get(&x).map(|read| (x, read))) {
-                if noted.insert(x) {
-                    log.push(format!("hybrid /XRefStm at {x} named again by the section at {off}; read once"));
-                }
-                if let Some(stm) = read {
-                    for (num, old) in &sect {
-                        // The table places the object somewhere other than the stream does.
-                        if !matches!(old, XrefEntry::Free { .. }) && stm.get(num).is_some_and(|e| e != old) {
-                            odd.push(*num);
-                        }
-                    }
-                }
-            } else if let Some(x) = hybrid {
-                let mut stm = BTreeMap::new();
-                let read = match self.read_section(x as usize, &mut stm, &mut odd, log) {
-                    Ok(_) => {
-                        for (&num, &e) in &stm {
-                            match sect.get(&num) {
-                                None | Some(XrefEntry::Free { .. }) => {
-                                    sect.insert(num, e);
-                                }
-                                // The table already places the object somewhere else.
-                                Some(old) if *old != e => odd.push(num),
-                                Some(_) => {}
-                            }
-                        }
-                        Some(stm)
-                    }
-                    Err(e) => {
-                        log.push(format!("hybrid /XRefStm at {x} unreadable: {e}"));
-                        None
-                    }
-                };
-                let rows = read.as_ref().map_or(0, BTreeMap::len);
-                if let Some(total) = hybrid_rows.checked_add(rows).filter(|total| *total <= MAX_XREF_OBJECTS) {
-                    hybrid_rows = total;
-                    hybrids.insert(x, read);
-                }
-            }
+
+            self.process_hybrid_stream(off, &sect_trailer, &mut sect, &mut odd, log, &mut hybrids, &mut hybrid_rows, &mut noted);
+
             oddities.extend(odd.into_iter().map(|num| (off, num)));
             for (num, e) in sect {
                 entries.entry(num).or_insert(e);
@@ -1861,6 +1809,91 @@ impl Document {
             trailer.remove(k);
         }
         Ok((entries, trailer, revisions, oddities))
+    }
+
+    /// Reads a section at `off`, retrying relative to the header if necessary and unreadable.
+    fn read_section_with_retry(
+        &self,
+        off: u64,
+        sect: &mut BTreeMap<u32, XrefEntry>,
+        odd: &mut Vec<u32>,
+        log: &mut Vec<String>,
+        revisions_is_empty: bool,
+    ) -> Result<(Dict, bool, bool), CosError> {
+        match self.read_section(off as usize, sect, odd, log) {
+            Ok(v) => Ok((v.0, v.1, false)),
+            Err(e) if self.header_offset > 0 => {
+                log.push(format!("xref at {off} unreadable ({e}); retrying relative to the header"));
+                sect.clear();
+                odd.clear();
+                let v = self.read_section(off as usize + self.header_offset, sect, odd, log)?;
+                Ok((v.0, v.1, true))
+            }
+            Err(e) => {
+                // An unreadable older section loses every object only it locates (the page
+                // tree, often): rebuild from object headers, as readers do (#1656).
+                if !revisions_is_empty {
+                    log.push(format!("older cross-reference section at {off} is unreadable: {e}"));
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Hybrid files (§7.5.8.4): the /XRefStm entries supplement the table and replace the
+    /// free entries it gives objects only a cross-reference stream can locate.
+    /// Processes hybrid stream entries if `/XRefStm` is present in the section trailer.
+    fn process_hybrid_stream(
+        &self,
+        off: u64,
+        sect_trailer: &Dict,
+        sect: &mut BTreeMap<u32, XrefEntry>,
+        odd: &mut Vec<u32>,
+        log: &mut Vec<String>,
+        hybrids: &mut HashMap<i64, Option<BTreeMap<u32, XrefEntry>>>,
+        hybrid_rows: &mut usize,
+        noted: &mut HashSet<i64>,
+    ) {
+        let hybrid = sect_trailer.int(b"XRefStm").filter(|x| *x >= 0);
+        
+        if let Some((x, read)) = hybrid.and_then(|x| hybrids.get(&x).map(|read| (x, read))) {
+            if noted.insert(x) {
+                log.push(format!("hybrid /XRefStm at {x} named again by the section at {off}; read once"));
+            }
+            if let Some(stm) = read {
+                // The table places the object somewhere other than the stream does.
+                for (num, old) in &sect {
+                    if !matches!(old, XrefEntry::Free { .. }) && stm.get(num).is_some_and(|e| e != old) {
+                        odd.push(*num);
+                    }
+                }
+            }
+        } else if let Some(x) = hybrid {
+            let mut stm = BTreeMap::new();
+            let read = match self.read_section(x as usize, &mut stm, odd, log) {
+                Ok(_) => {
+                    for (&num, &e) in &stm {
+                        match sect.get(&num) {
+                            None | Some(XrefEntry::Free { .. }) => {
+                                sect.insert(num, e);
+                            }
+                            Some(old) if *old != e => odd.push(num),
+                            Some(_) => {}
+                        }
+                    }
+                    Some(stm)
+                }
+                Err(e) => {
+                    log.push(format!("hybrid /XRefStm at {x} unreadable: {e}"));
+                    None
+                }
+            };
+            let rows = read.as_ref().map_or(0, BTreeMap::len);
+            if let Some(total) = hybrid_rows.checked_add(rows).filter(|total| *total <= MAX_XREF_OBJECTS) {
+                *hybrid_rows = total;
+                hybrids.insert(x, read);
+            }
+        }
     }
 
     /// Read one section at `off`, adding entries not already known (newer sections win). `odd`
